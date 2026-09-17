@@ -12,7 +12,7 @@ use std::os::raw::*;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 
 use vmm_sys_util::ioctl::{ioctl_with_mut_ref, ioctl_with_ref, ioctl_with_val};
-use vmm_sys_util::ioctl_iow_nr;
+use vmm_sys_util::{ioctl_ior_nr, ioctl_iow_nr};
 
 use crate::devices::virtio::iovec::IoVecBuffer;
 use crate::devices::virtio::net::generated;
@@ -35,12 +35,22 @@ pub enum TapError {
     SetOffloadFlags(IoError),
     /// Error while setting size of the vnet header: {0}
     SetSizeOfVnetHdr(IoError),
+    /// The pre-opened tap descriptor is not a TAP queue with compatible flags (flags: {0:#x})
+    IncompatiblePreopenedTapFlags(i32),
+    /// Invalid `fd:<fd>:<if_name>` tap open spec: {0}
+    InvalidFdSpec(String),
+    /// Failed to dup the inherited tap descriptor: {0}
+    DupInheritedTap(IoError),
+    /// Inherited tap descriptor is attached to {actual}, expected {expected}
+    InheritedTapNameMismatch { expected: String, actual: String },
 }
 
 const TUNTAP: ::std::os::raw::c_uint = 84;
 ioctl_iow_nr!(TUNSETIFF, TUNTAP, 202, ::std::os::raw::c_int);
 ioctl_iow_nr!(TUNSETOFFLOAD, TUNTAP, 208, ::std::os::raw::c_uint);
 ioctl_iow_nr!(TUNSETVNETHDRSZ, TUNTAP, 216, ::std::os::raw::c_int);
+// TUNGETIFF is _IOR('T', 210, unsigned int).
+ioctl_ior_nr!(TUNGETIFF, TUNTAP, 210, ::std::os::raw::c_uint);
 
 /// Handle for a network tap interface.
 ///
@@ -68,6 +78,33 @@ fn build_terminated_if_name(if_name: &str) -> Result<[u8; IFACE_NAME_MAX_LEN], T
     terminated_if_name[..if_name.len()].copy_from_slice(if_name);
 
     Ok(terminated_if_name)
+}
+
+/// The two shapes a tap open spec (`host_dev_name`) can take: a plain
+/// interface name, or an `fd:<fd>:<if_name>` spec naming a queue descriptor
+/// inherited from the launcher process.
+enum TapOpenSpec<'a> {
+    Name(&'a str),
+    Fd { fd: RawFd, if_name: &'a str },
+}
+
+const FD_SPEC_PREFIX: &str = "fd:";
+
+fn parse_tap_open_spec(spec: &str) -> Result<TapOpenSpec<'_>, TapError> {
+    match spec.strip_prefix(FD_SPEC_PREFIX) {
+        None => Ok(TapOpenSpec::Name(spec)),
+        Some(rest) => {
+            let invalid = || TapError::InvalidFdSpec(spec.to_owned());
+            let (fd, if_name) = rest.split_once(':').ok_or_else(invalid)?;
+            let fd = fd.parse::<RawFd>().map_err(|_| invalid())?;
+            // Stdio descriptors are never valid, and an empty name always
+            // fails the later checks; reject both up front.
+            if fd <= 2 || if_name.is_empty() {
+                return Err(invalid());
+            }
+            Ok(TapOpenSpec::Fd { fd, if_name })
+        }
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -148,6 +185,69 @@ impl Tap {
             // SAFETY: Safe since only the name is accessed, and it's cloned out.
             if_name: unsafe { ifreq.ifr_ifrn.ifrn_name },
         })
+    }
+
+    /// Wraps a pre-opened TAP queue descriptor inherited from the launcher
+    /// process. The descriptor must be a TAP queue opened with the same flags
+    /// [`Tap::open_named`] uses (`IFF_TAP | IFF_NO_PI | IFF_VNET_HDR`);
+    /// `TUNGETIFF` validates both the descriptor kind and the flags.
+    pub fn from_fd(fd: RawFd) -> Result<Tap, TapError> {
+        // SAFETY: We take ownership of the descriptor; TUNGETIFF below fails
+        // cleanly on anything that is not a tun/tap queue, and dropping the
+        // File then closes the (already handed-over) descriptor.
+        let tap_file = unsafe { File::from_raw_fd(fd) };
+        let ifreq = IfReqBuilder::new()
+            .execute(&tap_file, TUNGETIFF())
+            .map_err(|io_error| {
+                TapError::IfreqExecuteError(io_error, "pre-opened descriptor".to_owned())
+            })?;
+        // SAFETY: Reading the union field the kernel just filled in.
+        let flags = i32::from(unsafe { ifreq.ifr_ifru.ifru_flags });
+        let required = i32::from(
+            i16::try_from(generated::IFF_TAP | generated::IFF_NO_PI | generated::IFF_VNET_HDR)
+                .unwrap(),
+        );
+        if flags & required != required {
+            return Err(TapError::IncompatiblePreopenedTapFlags(flags));
+        }
+
+        Ok(Tap {
+            tap_file,
+            // SAFETY: Safe since only the name is accessed, and it's cloned out.
+            if_name: unsafe { ifreq.ifr_ifrn.ifrn_name },
+        })
+    }
+
+    /// Opens the tap described by `host_dev_name`: a plain interface name, or an
+    /// `fd:<fd>:<if_name>` spec naming a queue descriptor inherited from the
+    /// launcher process.
+    pub fn open_named_or_fd(spec: &str) -> Result<Tap, TapError> {
+        match parse_tap_open_spec(spec)? {
+            TapOpenSpec::Name(name) => Tap::open_named(name),
+            TapOpenSpec::Fd { fd, if_name } => Tap::from_inherited_fd(fd, if_name),
+        }
+    }
+
+    /// Wraps a queue descriptor inherited from the launcher process. The fd is
+    /// dup'd rather than taken over, so consumption is idempotent and the parked
+    /// descriptor stays valid for the process lifetime. TUNGETIFF (via
+    /// [`Tap::from_fd`]) validates the queue kind and flags, and the attached
+    /// interface name must match `expected_if_name`.
+    pub fn from_inherited_fd(fd: RawFd, expected_if_name: &str) -> Result<Tap, TapError> {
+        // SAFETY: fcntl with any fd number is safe; fails with EBADF when invalid.
+        let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if dup < 0 {
+            return Err(TapError::DupInheritedTap(IoError::last_os_error()));
+        }
+        let tap = Tap::from_fd(dup)?;
+        let actual = tap.if_name_as_str().to_owned();
+        if actual != expected_if_name {
+            return Err(TapError::InheritedTapNameMismatch {
+                expected: expected_if_name.to_owned(),
+                actual,
+            });
+        }
+        Ok(tap)
     }
 
     /// Retrieve the interface's name as a str.
@@ -286,6 +386,87 @@ pub mod tests {
     fn test_raw_fd() {
         let tap = Tap::open_named("").unwrap();
         assert_eq!(tap.as_raw_fd(), tap.tap_file.as_raw_fd());
+    }
+
+    #[test]
+    fn test_from_fd_wraps_open_named_queue() {
+        let tap = Tap::open_named("preopenedtap").unwrap();
+        // SAFETY: `dup` gives `from_fd` its own descriptor to take over.
+        let dup_fd = unsafe { libc::dup(tap.as_raw_fd()) };
+        assert!(dup_fd >= 0);
+
+        let restored_tap = Tap::from_fd(dup_fd).unwrap();
+        assert_eq!(tap.if_name_as_str(), "preopenedtap");
+        assert_eq!(restored_tap.if_name_as_str(), "preopenedtap");
+    }
+
+    #[test]
+    fn test_from_fd_rejects_non_tap_descriptor() {
+        let file = File::open("/dev/null").unwrap();
+        // SAFETY: `dup` gives `from_fd` its own descriptor, so both owners
+        // close their own copy.
+        let dup_fd = unsafe { libc::dup(file.as_raw_fd()) };
+        assert!(dup_fd >= 0);
+
+        assert!(matches!(
+            Tap::from_fd(dup_fd),
+            Err(TapError::IfreqExecuteError(_, _))
+        ));
+    }
+
+    #[test]
+    fn test_parse_tap_open_spec() {
+        assert!(matches!(
+            parse_tap_open_spec("tap0").unwrap(),
+            TapOpenSpec::Name("tap0")
+        ));
+        assert!(matches!(
+            parse_tap_open_spec("fd:3:tap0").unwrap(),
+            TapOpenSpec::Fd {
+                fd: 3,
+                if_name: "tap0"
+            }
+        ));
+
+        for spec in ["fd:abc:tap0", "fd:3:", "fd:1:tap0", "fd:3tap0"] {
+            assert!(
+                matches!(
+                    parse_tap_open_spec(spec),
+                    Err(TapError::InvalidFdSpec(_))
+                ),
+                "expected InvalidFdSpec for {spec:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_from_inherited_fd_dups_and_validates() {
+        let tap = Tap::open_named("inheritedtap").unwrap();
+        // The inherited descriptor stays open; from_inherited_fd works off a dup.
+        let inherited = Tap::from_inherited_fd(tap.as_raw_fd(), "inheritedtap").unwrap();
+        assert_eq!(inherited.if_name_as_str(), "inheritedtap");
+        assert_ne!(inherited.as_raw_fd(), tap.as_raw_fd());
+        // SAFETY: fcntl with a valid fd is safe.
+        assert!(unsafe { libc::fcntl(tap.as_raw_fd(), libc::F_GETFD) } >= 0);
+
+        // A queue parked on a different interface than the spec claims is a hard error.
+        assert!(matches!(
+            Tap::from_inherited_fd(tap.as_raw_fd(), "othertap"),
+            Err(TapError::InheritedTapNameMismatch { .. })
+        ));
+
+        // A descriptor that is not a TAP queue fails the TUNGETIFF check.
+        let file = File::open("/dev/null").unwrap();
+        assert!(matches!(
+            Tap::from_inherited_fd(file.as_raw_fd(), "inheritedtap"),
+            Err(TapError::IfreqExecuteError(_, _))
+        ));
+
+        // A closed descriptor cannot be dup'd.
+        assert!(matches!(
+            Tap::from_inherited_fd(-1, "inheritedtap"),
+            Err(TapError::DupInheritedTap(_))
+        ));
     }
 
     #[test]

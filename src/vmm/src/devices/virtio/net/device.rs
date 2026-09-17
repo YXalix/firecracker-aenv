@@ -334,7 +334,7 @@ impl Net {
         rx_rate_limiter: RateLimiter,
         tx_rate_limiter: RateLimiter,
     ) -> Result<Self, NetError> {
-        let tap = Tap::open_named(tap_if_name).map_err(NetError::TapOpen)?;
+        let tap = Tap::open_named_or_fd(tap_if_name).map_err(NetError::TapOpen)?;
 
         let vnet_hdr_size = i32::try_from(vnet_hdr_len()).unwrap();
         tap.set_vnet_hdr_size(vnet_hdr_size)
