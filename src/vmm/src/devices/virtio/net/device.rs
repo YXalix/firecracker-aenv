@@ -336,9 +336,13 @@ impl Net {
     ) -> Result<Self, NetError> {
         let tap = Tap::open_named_or_fd(tap_if_name).map_err(NetError::TapOpen)?;
 
-        let vnet_hdr_size = i32::try_from(vnet_hdr_len()).unwrap();
-        tap.set_vnet_hdr_size(vnet_hdr_size)
-            .map_err(NetError::TapSetVnetHdrSize)?;
+        // An `fdp:`-spec queue arrives with the vnet header size already set
+        // by the launcher; re-setting it would only burn a rtnl round trip.
+        if !tap.vnet_hdr_size_preset {
+            let vnet_hdr_size = i32::try_from(vnet_hdr_len()).unwrap();
+            tap.set_vnet_hdr_size(vnet_hdr_size)
+                .map_err(NetError::TapSetVnetHdrSize)?;
+        }
 
         Self::new_with_tap(id, tap, guest_mac, rx_rate_limiter, tx_rate_limiter)
     }
