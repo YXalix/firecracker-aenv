@@ -58,7 +58,9 @@ pub struct Tap {
     /// Whether the queue arrived via an `fdp:` spec with its vnet header
     /// size already set to the value Firecracker would pick, so the
     /// [`Net::new`](crate::devices::virtio::net::Net::new) configuration
-    /// step can be skipped.
+    /// step can be skipped. It also marks the queue as carrying the
+    /// launcher's offload preset, gating the TUNSETOFFLOAD skip in
+    /// `Net::activate`.
     pub(crate) vnet_hdr_size_preset: bool,
 }
 
