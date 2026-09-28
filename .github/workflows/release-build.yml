@@ -1,0 +1,82 @@
+name: release build
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build (e.g. v1.15.1-patch-v3)'
+        required: true
+  push:
+    tags:
+      - 'v1.15.1-patch-v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # 仅允许 v1.15.1-patch 分支的手动 dispatch 和该分支的 tag push 触发
+    if: >-
+      github.ref == 'refs/heads/v1.15.1-patch' ||
+      startsWith(github.ref, 'refs/tags/v1.15.1-patch-v')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest        # x86_64
+            arch: x86_64
+          - os: ubuntu-24.04-arm     # aarch64（公开仓库免费）
+            arch: aarch64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: Check version matches tag
+        run: |
+          VER="${TAG#v}"
+          grep -q "^version = \"$VER\"" src/firecracker/Cargo.toml
+
+      - name: Build release artifacts (devctr)
+        run: ./tools/devtool -y make_release
+
+      - name: Verify & pack
+        run: |
+          VER="${TAG#v}"
+          R="release-v${VER}-${ARCH}"
+          "./$R/firecracker-v${VER}-${ARCH}" --version | grep -Fx "Firecracker v${VER}"
+          file "$R/firecracker-v${VER}-${ARCH}" | grep -Eq "static-pie linked|statically linked"
+          mkdir -p out
+          cp "$R/firecracker-v${VER}-${ARCH}" out/firecracker
+          cp "$R/cpu-template-helper-v${VER}-${ARCH}" out/cpu-template-helper
+          { echo "# Firecracker ${TAG}"; echo; \
+            awk -v sec="## [${VER}]" 'index($0,sec)==1{f=1;next} /^## \[/{f=0} f' CHANGELOG.md; } \
+            > out/RELEASE_NOTES.md
+          (cd out \
+            && tar czf "firecracker-${VER}-${ARCH}.tgz" firecracker cpu-template-helper \
+            && sha256sum "firecracker-${VER}-${ARCH}.tgz" > "firecracker-${VER}-${ARCH}.tgz.sha256.txt")
+
+      - name: Create release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" \
+                 --title "Firecracker $TAG" \
+                 --notes-file out/RELEASE_NOTES.md \
+                 || true   # 两个 matrix job 竞争创建时后者忽略 already_exists
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VER="${TAG#v}"
+          gh release upload "$TAG" \
+            "out/firecracker-${VER}-${ARCH}.tgz" \
+            "out/firecracker-${VER}-${ARCH}.tgz.sha256.txt" \
+            --clobber
