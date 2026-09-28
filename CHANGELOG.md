@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.1-patch-v3]
+
+### Added
+
+- Accept pre-configured TAP queues via `host_dev_name`: the new
+  `fdp:<fd>:<if_name>` form names a TAP queue fd that the launcher pre-opened
+  and pre-configured (attached with `IFF_TAP|IFF_NO_PI|IFF_VNET_HDR`, vnet
+  header size already set). Firecracker trusts that contract and skips the
+  `TUNGETIFF` validation and `TUNSETVNETHDRSZ`, keeping both rtnl-taking
+  ioctls off the boot and restore paths. The parked fd is dup'd
+  (`F_DUPFD_CLOEXEC`), so consumption is idempotent; a plain interface name
+  keeps the existing open-by-name behavior.
+
+### Changed
+
+- Skip `TUNSETOFFLOAD` on activation when a queue is pre-configured via
+  `fdp:` and the guest's negotiated offload set matches the launcher preset
+  exactly (`TUN_F_CSUM|TSO4|TSO6|UFO` for a standard Linux guest); any other
+  negotiation still programs the negotiated flags. This also removes the
+  rtnl-taking ioctl from snapshot restore for pre-configured queues.
+
 ## [1.15.1-patch-v2]
 
 ### Added
