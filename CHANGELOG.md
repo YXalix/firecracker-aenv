@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.1-patch-v4]
+
+### Changed
+
+- Guest memory discard — balloon free-page reporting, free-page hinting,
+  inflate, and mem hotplug unplug — now uses `madvise(MADV_DONTNEED)` for
+  every memory backing, including private file mappings. The previous
+  `mmap(MAP_FIXED)` anonymous re-mapping split the enclosing VMA at every
+  discarded range; free page reporting delivers ranges as small as the
+  reporting order (order 6 → 256 KiB), so a full sweep fragmented guest
+  memory into thousands of adjacent VMAs and made every later mmap, fault,
+  and lookup expensive. On a private file mapping a discarded range now
+  re-faults from the backing file instead of reading zeros; the
+  free-page-reporting contract allows reported pages to take any content,
+  and the clean page-cache pages of the backing file stay
+  kernel-reclaimable.
+
+### Removed
+
+- The `dirty_ranges`/`discarded_ranges` views of
+  `GET /vm/dirty-memory-ranges` and its `views` query parameter never
+  shipped: this v4 tag replaces the briefly published one, dropping the
+  feature commit those views came from. The private-mapping discard path
+  they observed is now plain `madvise(MADV_DONTNEED)`, so the extra views
+  no longer apply.
+
 ## [1.15.1-patch-v3]
 
 ### Added
