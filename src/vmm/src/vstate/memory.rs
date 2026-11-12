@@ -470,54 +470,30 @@ impl GuestRegionMmapExt {
     ) -> Result<(), GuestMemoryError> {
         let phys_address = self.get_host_address(caddr)?;
 
-        match (self.inner.file_offset(), self.inner.flags()) {
-            // If and only if we are resuming from a snapshot file, we have a file and it's mapped
-            // private
-            (Some(_), flags) if flags & libc::MAP_PRIVATE != 0 => {
-                // Mmap a new anonymous region over the present one in order to create a hole
-                // with zero pages.
-                // This workaround is (only) needed after resuming from a snapshot file because the
-                // guest memory is mmaped from file as private. In this case, MADV_DONTNEED on the
-                // file only drops any anonymous pages in range, but subsequent accesses would read
-                // whatever page is stored on the backing file. Mmapping anonymous pages ensures
-                // it's zeroed.
-                // SAFETY: The address and length are known to be valid.
-                let ret = unsafe {
-                    libc::mmap(
-                        phys_address.cast(),
-                        len,
-                        libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_FIXED | libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
-                        -1,
-                        0,
-                    )
-                };
-                if ret == libc::MAP_FAILED {
-                    let os_error = std::io::Error::last_os_error();
-                    error!("discard_range: mmap failed: {:?}", os_error);
-                    Err(GuestMemoryError::IOError(os_error))
-                } else {
-                    Ok(())
-                }
-            }
-            // Match either the case of an anonymous mapping, or the case
-            // of a shared file mapping.
-            // TODO: madvise(MADV_DONTNEED) doesn't actually work with memfd
-            // (or in general MAP_SHARED of a fd). In those cases we should use
-            // fallocate64(FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE).
-            // We keep falling to the madvise branch to keep the previous behaviour.
-            _ => {
-                // Madvise the region in order to mark it as not used.
-                // SAFETY: The address and length are known to be valid.
-                let ret = unsafe { libc::madvise(phys_address.cast(), len, libc::MADV_DONTNEED) };
-                if ret < 0 {
-                    let os_error = std::io::Error::last_os_error();
-                    error!("discard_range: madvise failed: {:?}", os_error);
-                    Err(GuestMemoryError::IOError(os_error))
-                } else {
-                    Ok(())
-                }
-            }
+        // Discard via madvise(MADV_DONTNEED) for every backing, including
+        // private file mappings. The previous mmap(MAP_FIXED) re-mapping of
+        // anonymous pages split the enclosing VMA at every discarded range;
+        // free page reporting delivers ranges as small as the reporting order
+        // (order 6 -> 256 KiB), so a full sweep fragmented guest memory into
+        // thousands of adjacent VMAs, and every later mmap/fault/lookup paid
+        // for it. MADV_DONTNEED leaves the VMA layout untouched.
+        //
+        // On a private file mapping MADV_DONTNEED only drops the private pages
+        // in range, so subsequent accesses re-fault from the backing file
+        // instead of reading zeros. This is acceptable for free page reporting,
+        // whose contract allows reported pages to take any content: the guest
+        // treats them as free and re-zeroes them as its allocator requires.
+        // The clean page-cache pages of the backing file stay resident but are
+        // kernel-reclaimable, so host memory is still returned under pressure.
+        // Madvise the region in order to mark it as not used.
+        // SAFETY: The address and length are known to be valid.
+        let ret = unsafe { libc::madvise(phys_address.cast(), len, libc::MADV_DONTNEED) };
+        if ret < 0 {
+            let os_error = std::io::Error::last_os_error();
+            error!("discard_range: madvise failed: {:?}", os_error);
+            Err(GuestMemoryError::IOError(os_error))
+        } else {
+            Ok(())
         }
     }
 }
@@ -1601,11 +1577,13 @@ mod tests {
         // Remove the first page.
         mem.discard_range(GuestAddress(0), page_size).unwrap();
 
-        // Check that the first page is zeroed.
+        // MADV_DONTNEED on a private file mapping drops the private pages in
+        // range, so the first page re-faults from the backing file instead of
+        // reading zeros.
         let mut actual_page = vec![0u8; page_size];
         mem.read(actual_page.as_mut_slice(), GuestAddress(0))
             .unwrap();
-        assert_eq!(vec![0u8; page_size], actual_page);
+        assert_eq!(vec![2u8; page_size], actual_page);
         // Check that the second page still contains ones.
         mem.read(actual_page.as_mut_slice(), GuestAddress(page_size as u64))
             .unwrap();
@@ -1623,7 +1601,7 @@ mod tests {
             GuestMemoryError::InvalidGuestAddress(_)
         );
 
-        // Mmap fail: the guest address is not aligned to the page size.
+        // Madvise fail: the guest address is not aligned to the page size.
         assert_match!(
             mem.discard_range(GuestAddress(0x20), page_size)
                 .unwrap_err(),
